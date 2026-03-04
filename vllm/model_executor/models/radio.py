@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.intern_vit import (
@@ -27,6 +28,7 @@ from vllm.model_executor.models.intern_vit import (
     InternVisionEncoder,
     InternVisionEncoderLayer,
 )
+from vllm.model_executor.models.vision import should_torch_compile_mm_vit
 
 input_dim_t: TypeAlias = int | tuple[int, int]
 norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
@@ -503,6 +505,10 @@ class RadioParallelAttention(InternParallelAttention):
         return out
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": [0, 1]},
+    enable_if=should_torch_compile_mm_vit,
+)
 class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
@@ -524,7 +530,10 @@ class RadioVisionEncoderLayer(InternVisionEncoderLayer):
 
 class RadioVisionEncoder(InternVisionEncoder):
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, layer_cls=RadioVisionEncoderLayer, **kwargs)
+        from vllm.compilation.backends import set_model_tag
+
+        with set_model_tag("RadioVisionEncoderLayer", is_encoder=True):
+            super().__init__(*args, layer_cls=RadioVisionEncoderLayer, **kwargs)
 
     def forward(
         self,
