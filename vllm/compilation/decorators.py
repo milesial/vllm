@@ -336,7 +336,7 @@ def _support_torch_compile(
 
     def __init__(
         self: _T,
-        *,
+        *args: Any,
         vllm_config: VllmConfig | None = None,
         prefix: str = "",
         **kwargs: Any,
@@ -352,7 +352,7 @@ def _support_torch_compile(
             kwargs["vllm_config"] = vllm_config
         if "prefix" in sig.parameters:
             kwargs["prefix"] = prefix
-        old_init(self, **kwargs)
+        old_init(self, *args, **kwargs)
 
         self.vllm_config = vllm_config
         self.compilation_config = self.vllm_config.compilation_config
