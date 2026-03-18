@@ -19,6 +19,7 @@ import torch.nn as nn
 from transformers import BatchFeature
 
 from vllm.config import VllmConfig
+from vllm.forward_context import set_forward_context
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
@@ -797,6 +798,7 @@ class NemotronH_Nano_VL_V2(
         model_config = vllm_config.model_config
         config = model_config.hf_config
         multimodal_config = model_config.multimodal_config
+        self.vllm_config = vllm_config
         image_size = config.force_image_size
         patch_size = config.patch_size
         self.patch_size = patch_size
@@ -944,7 +946,8 @@ class NemotronH_Nano_VL_V2(
         self, pixel_values: torch.Tensor, imgs_sizes: list[tuple[int, int]]
     ):
         """Dynamic resolution extract_feature for images."""
-        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        with set_forward_context(None, self.vllm_config):
+            _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes=imgs_sizes)
         vit_embeds = self.mlp1(vit_embeds)
@@ -959,7 +962,10 @@ class NemotronH_Nano_VL_V2(
         n = pixel_values.shape[0]
         vit_embeds_list = []
         for i in range(0, n, micro_batch_size):
-            _, vit_embeds = self.vision_model(pixel_values[i : i + micro_batch_size])
+            with set_forward_context(None, self.vllm_config):
+                _, vit_embeds = self.vision_model(
+                    pixel_values[i : i + micro_batch_size]
+                )
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
             h = w = int(vit_embeds.shape[1] ** 0.5)
             vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
