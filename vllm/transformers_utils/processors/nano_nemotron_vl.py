@@ -79,10 +79,10 @@ def dynamic_preprocess(
         use_thumbnail=False,
     )
 
-    image = np.asarray(
-        image.convert("RGB") if image.mode != "RGB" else image, dtype=np.uint8
-    )
+    if image.mode != "RGB":
+        image = image.convert("RGB")
 
+    image = np.asarray(image, dtype=np.uint8)
     image = torch.from_numpy(image).unsqueeze(0)  # (1, H, W, 3)
     image = image.permute(0, 3, 1, 2)  # (1, 3, H, W)
 
@@ -95,24 +95,24 @@ def dynamic_preprocess(
     )
     B, C, H, W = resized_img.shape
     hp, wp = H // image_size, W // image_size
-    patches = (
-        resized_img.reshape(B, C, hp, image_size, wp, image_size)
-        .permute(0, 2, 4, 1, 3, 5)
-        .reshape(B * hp * wp, C, image_size, image_size)
-        / 255.0
-    )
+    # Separate float conversion and in-place normalization avoids
+    # the extra intermediate tensor that `/ 255.0` creates.
+    patches = resized_img.reshape(
+        B, C, hp, image_size, wp, image_size
+    ).permute(0, 2, 4, 1, 3, 5).reshape(
+        B * hp * wp, C, image_size, image_size
+    ).float()
+    patches.div_(255.0)
 
     if use_thumbnail and patches.shape[0] > 1:
-        thumb = (
-            torch.nn.functional.interpolate(
-                image,
-                size=(image_size, image_size),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-            / 255.0
-        )
+        thumb = torch.nn.functional.interpolate(
+            image,
+            size=(image_size, image_size),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).float()
+        thumb.div_(255.0)
         patches = torch.cat([patches, thumb], dim=0)
 
     return list(patches)
@@ -151,15 +151,18 @@ def video_to_pixel_values(
     video_tensor = torch.from_numpy(video).permute(0, 3, 1, 2)
 
     if video_tensor.shape[2] != input_size or video_tensor.shape[3] != input_size:
+        # F.interpolate on uint8 is efficient; convert to float after resize
         video_tensor = torch.nn.functional.interpolate(
             video_tensor,
             size=(input_size, input_size),
             mode="bicubic",
             align_corners=False,
             antialias=True,
-        )
+        ).float()
+    else:
+        video_tensor = video_tensor.float()
 
-    video_tensor = video_tensor / 255.0
+    video_tensor.div_(255.0)
 
     return video_tensor
 
@@ -283,20 +286,18 @@ class DynamicResolutionImageTiler:
             params.patch_size[1] * self._patch_size,
             params.patch_size[0] * self._patch_size,
         )
-        image = np.asarray(
-            params.media.convert("RGB") if params.media.mode != "RGB" else params.media,
-            dtype=np.uint8,
-        )
-        resized_img = (
-            torch.nn.functional.interpolate(
-                torch.from_numpy(image).unsqueeze(0).permute(0, 3, 1, 2),
-                size=target_size,
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-            / 255.0
-        )
+        media = params.media
+        if media.mode != "RGB":
+            media = media.convert("RGB")
+        image = np.asarray(media, dtype=np.uint8)
+        resized_img = torch.nn.functional.interpolate(
+            torch.from_numpy(image).unsqueeze(0).permute(0, 3, 1, 2),
+            size=target_size,
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).float()
+        resized_img.div_(255.0)
         return list(resized_img)
 
     def process_media(
