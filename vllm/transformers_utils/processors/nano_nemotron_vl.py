@@ -10,6 +10,7 @@
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -253,10 +254,28 @@ class DynamicResolutionImageTiler:
         num_tokens_available = self.max_num_tokens_available(text_prompt_length)
         params_per_image = self.compute_params(images, num_tokens_available)
 
+        if len(params_per_image) <= 1:
+            feature_sizes = []
+            images = []
+            for param in params_per_image:
+                for t in self.apply_params(param):
+                    assert t.ndim == 3, f"{t.ndim=}: expected 3 dim tensor"
+                    images.append(t)
+                    feature_sizes.append(param.num_embeddings)
+            return images, feature_sizes
+
+        def _apply(param: self.DynamicResolutionParams) -> list[torch.Tensor]:
+            return self.apply_params(param)
+
+        with ThreadPoolExecutor(
+            max_workers=min(len(params_per_image), 4)
+        ) as pool:
+            results = list(pool.map(_apply, params_per_image))
+
         feature_sizes = []
         images = []
-        for param in params_per_image:
-            for t in self.apply_params(param):
+        for param, tensors in zip(params_per_image, results):
+            for t in tensors:
                 assert t.ndim == 3, f"{t.ndim=}: expected 3 dim tensor"
                 images.append(t)
                 feature_sizes.append(param.num_embeddings)
@@ -585,16 +604,30 @@ class BaseNanoNemotronVLProcessor(ABC):
         images: list[Image.Image],
         max_num_tiles: int,
     ) -> list[torch.Tensor]:
-        return [
-            image_to_pixel_values(
+        if len(images) <= 1:
+            return [
+                image_to_pixel_values(
+                    image,
+                    input_size=self.image_size,
+                    max_num=max_num_tiles,
+                    use_thumbnail=self.use_thumbnail,
+                    idx=idx,
+                )
+                for idx, image in enumerate(images)
+            ]
+
+        def _process(idx_image: tuple[int, Image.Image]) -> torch.Tensor:
+            idx, image = idx_image
+            return image_to_pixel_values(
                 image,
                 input_size=self.image_size,
                 max_num=max_num_tiles,
                 use_thumbnail=self.use_thumbnail,
                 idx=idx,
             )
-            for idx, image in enumerate(images)
-        ]
+
+        with ThreadPoolExecutor(max_workers=min(len(images), 4)) as pool:
+            return list(pool.map(_process, enumerate(images)))
 
     def _preprocess_image(
         self,
@@ -870,9 +903,9 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             return_tensors="pt",
         )
         audio_inputs = {
-            "input_audio_features": audio_inputs.input_features,
-            "feature_attention_mask": audio_inputs.attention_mask,
-            "audio_num_clips": audio_inputs.audio_num_clips,
+            "input_audio_waveforms": audio_inputs["input_audio_waveforms"],
+            "audio_clip_lengths": audio_inputs["audio_clip_lengths"],
+            "audio_num_clips": audio_inputs["audio_num_clips"],
         }
 
         return text, audio_inputs
