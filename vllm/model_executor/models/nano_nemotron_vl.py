@@ -100,14 +100,12 @@ class NanoNemotronVLAudioFeatureInputs(TensorSchema):
     """
     Dimensions:
         - c: Number of audio clips (possibly flattened across audio items)
-        - b: Number of original audio items
-        - t: Audio feature length
-        - f: Feature size (mel bins)
+        - s: Max waveform samples per clip
     """
 
     type: Literal["audio_features"] = "audio_features"
-    input_audio_features: Annotated[torch.Tensor, TensorShape("c", "t", "f")]
-    feature_attention_mask: Annotated[torch.Tensor, TensorShape("c", "t")]
+    input_audio_waveforms: Annotated[torch.Tensor, TensorShape("c", "s")]
+    audio_clip_lengths: Annotated[torch.Tensor, TensorShape("c")]
     audio_num_clips: list[int]
 
 
@@ -551,10 +549,10 @@ class NanoNemotronVLMultiModalProcessor(
         if self.info.audio_extractor is not None:
             audio_num_clips = torch.as_tensor(hf_inputs["audio_num_clips"])
             audio_fields = dict(
-                input_audio_features=MultiModalFieldConfig.flat_from_sizes(
+                input_audio_waveforms=MultiModalFieldConfig.flat_from_sizes(
                     "audio", audio_num_clips
                 ),
-                feature_attention_mask=MultiModalFieldConfig.flat_from_sizes(
+                audio_clip_lengths=MultiModalFieldConfig.flat_from_sizes(
                     "audio", audio_num_clips
                 ),
                 audio_num_clips=MultiModalFieldConfig.batched(
@@ -887,65 +885,53 @@ class NemotronH_Nano_VL_V2(
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
-        # N, W, H, C --> N, W, H * scale, C // scale
-        x = x.view(
-            n,
-            w,
-            int(h * scale_factor),
-            int(c / scale_factor),
-        )
-        # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
-        x = x.permute(0, 2, 1, 3).contiguous()
-        # N, H * scale, W, C // scale -->
-        # N, H * scale, W * scale, C // (scale ** 2)
-        x = x.view(
-            n,
-            int(h * scale_factor),
-            int(w * scale_factor),
-            int(c / (scale_factor * scale_factor)),
-        )
+        r = int(1 / scale_factor)
+        new_w = w // r
+        new_h = h // r
+        new_c = c * r * r
+        # Fuse two permute+contiguous into one: decompose spatial dims into
+        # (blocks, sub-pixels) then single permute+reshape (1 copy, not 2).
+        # (n, w, h, c) -> (n, w//r, r, h//r, r, c)
+        x = x.view(n, new_w, r, new_h, r, c)
         if self.ps_version == "v1":
             warnings.warn(
                 "In ps_version 'v1', the height and width have not "
                 "been swapped back, which results in a transposed image.",
                 stacklevel=2,
             )
+            x = x.permute(0, 3, 1, 2, 4, 5).reshape(n, new_h, new_w, new_c)
         else:
-            x = x.permute(0, 2, 1, 3).contiguous()
+            x = x.permute(0, 1, 3, 2, 4, 5).reshape(n, new_w, new_h, new_c)
         return x
 
     def pixel_shuffle_dynamic_res(
         self, x: torch.Tensor, *, imgs_sizes: list[tuple[int, int]]
     ) -> torch.Tensor:
-        scale_factor = self.downsample_ratio
+        r = int(1 / self.downsample_ratio)
         patch_dim = self.patch_size
         seq_lens = calc_seq_lens(imgs_sizes, patch_dim)
         splits = torch.split(x, seq_lens, dim=-2)
+        is_v2 = self.ps_version == "v2"
         out = []
         for i, sv in enumerate(splits):
             h = imgs_sizes[i][0] // patch_dim
             w = imgs_sizes[i][1] // patch_dim
-            sv = sv.reshape(sv.shape[0], h, w, -1)
-
-            n, h, w, c = sv.size()
-
-            sv = sv.view(n, h, int(w * scale_factor), int(c / scale_factor))
-            sv = sv.permute(0, 2, 1, 3).contiguous()
-            sv = sv.view(
-                n,
-                int(w * scale_factor),
-                int(h * scale_factor),
-                int(c / (scale_factor * scale_factor)),
-            )
-
-            if self.ps_version == "v2":
-                sv = sv.permute(0, 2, 1, 3).contiguous()
-
-            sv = sv.reshape(sv.shape[0], -1, sv.shape[-1])
+            c = sv.shape[-1]
+            new_h = h // r
+            new_w = w // r
+            new_c = c * r * r
+            # Reshape from flat sequence to 6D block decomposition directly:
+            # (n, h*w, c) -> (n, h//r, r, w//r, r, c)
+            sv = sv.reshape(sv.shape[0], new_h, r, new_w, r, c)
+            if is_v2:
+                sv = sv.permute(0, 1, 3, 2, 4, 5).reshape(
+                    sv.shape[0], -1, new_c)
+            else:
+                sv = sv.permute(0, 3, 1, 2, 4, 5).reshape(
+                    sv.shape[0], -1, new_c)
             out.append(sv)
 
         x = torch.cat(out, dim=-2)
-
         return x
 
     def extract_feature_dynamic(
@@ -1101,16 +1087,22 @@ class NemotronH_Nano_VL_V2(
         self, audio_input: NanoNemotronVLAudioFeatureInputs
     ) -> tuple[torch.Tensor, ...]:
         assert self.sound_encoder is not None
-        input_audio_features = audio_input.input_audio_features
-        feature_attention_mask = audio_input.feature_attention_mask
+        waveforms = audio_input.input_audio_waveforms
+        clip_lengths = audio_input.audio_clip_lengths
         audio_num_clips = audio_input.audio_num_clips
         target_device = next(self.sound_encoder.parameters()).device
 
-        input_audio_features = input_audio_features.to(
-            dtype=self.llm_dtype, device=target_device
+        # Move raw waveforms to GPU and compute mel spectrogram there
+        waveforms = waveforms.to(dtype=torch.float32, device=target_device)
+        clip_lengths = clip_lengths.to(device=target_device)
+
+        # GPU mel spectrogram extraction (replaces CPU HF feature extractor)
+        mel_features, feature_attention_mask = self.sound_encoder.mel_transform(
+            waveforms, clip_lengths
         )
-        feature_attention_mask = feature_attention_mask.to(device=target_device)
-        sound_embeds = self.sound_encoder(input_audio_features, feature_attention_mask)
+        mel_features = mel_features.to(dtype=self.llm_dtype)
+
+        sound_embeds = self.sound_encoder(mel_features, feature_attention_mask)
 
         valid_input_lens = feature_attention_mask.sum(dim=1)
         valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
@@ -1238,8 +1230,8 @@ class NemotronH_Nano_VL_V2(
             if (
                 input_key
                 in (
-                    "input_audio_features",
-                    "feature_attention_mask",
+                    "input_audio_waveforms",
+                    "audio_clip_lengths",
                     "audio_num_clips",
                 )
                 and "audios" not in modalities
