@@ -17,7 +17,7 @@ class ParakeetConfig(ParakeetEncoderConfig):
         config: PretrainedConfig, *, llm_hidden_size: int, max_model_len: int
     ) -> "ParakeetConfig":
         assert isinstance(config, PretrainedConfig)
-        return ParakeetConfig(
+        parakeet_config = ParakeetConfig(
             **config.to_dict(),
             scale_input=False,
             attention_bias=False,
@@ -25,6 +25,11 @@ class ParakeetConfig(ParakeetEncoderConfig):
             max_position_embeddings=max_model_len
             + 1,  # + 1 because it seems like max_model_len+1 can be passed
         )
+        # Use SDPA backend instead of eager attention in the Conformer
+        # encoder. SDPA dispatches to memory-efficient / FlashAttention
+        # kernels when possible, reducing O(T^2) memory for long audio.
+        parakeet_config._attn_implementation = "sdpa"
+        return parakeet_config
 
 
 @dataclass(kw_only=True, frozen=True)
