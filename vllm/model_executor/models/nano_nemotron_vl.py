@@ -849,7 +849,7 @@ class NemotronH_Nano_VL_V2(
                     scope="global",
                 )
                 self.sound_encoder = ProjectedParakeet(
-                    config.sound_config,
+                    config=config.sound_config,
                     dtype=llm_dtype,
                     llm_hidden_size=llm_hidden_size,
                     max_model_len=model_config.max_model_len,

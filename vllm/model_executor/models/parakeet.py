@@ -13,6 +13,10 @@ import torch.nn as nn
 from transformers import ParakeetEncoder as HFParakeetEncoder
 from transformers import ParakeetFeatureExtractor, PretrainedConfig
 
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -40,6 +44,23 @@ class ParakeetProjection(nn.Module):
         return hidden_states
 
 
+def _parakeet_shape_invariants(
+    input_features: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> None:
+    if attention_mask is not None:
+        torch._check(input_features.shape[0] == attention_mask.shape[0])
+        torch._check(input_features.shape[1] == attention_mask.shape[1])
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_features": [0, 1],
+        "attention_mask": [0, 1],
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    shape_invariants=_parakeet_shape_invariants,
+)
 class ProjectedParakeet(nn.Module):
     def __init__(
         self,

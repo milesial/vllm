@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from vllm.compilation.decorators import ignore_torch_compile
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.intern_vit import (
@@ -503,6 +504,7 @@ class RadioParallelAttention(InternParallelAttention):
         return out
 
 
+@ignore_torch_compile
 class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
