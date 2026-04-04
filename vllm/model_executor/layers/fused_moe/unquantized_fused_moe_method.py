@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     select_unquantized_moe_backend,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_int,
     convert_moe_weights_to_flashinfer_trtllm_block_layout,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
@@ -239,10 +240,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
             _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
-            # Swap halves to arrange as [w3; w1] (kernel expectation)
-            w1_w, w3_w = torch.chunk(layer.w13_weight.data, 2, dim=1)
-            w13_weight_swapped = torch.cat([w3_w, w1_w], dim=1)
-            layer.w13_weight.data = w13_weight_swapped.contiguous()
+            if self.moe.is_act_and_mul:
+                # Swap halves to arrange as [w3; w1] only for gated MoE.
+                w1_w, w3_w = torch.chunk(layer.w13_weight.data, 2, dim=1)
+                w13_weight_swapped = torch.cat([w3_w, w1_w], dim=1)
+                layer.w13_weight.data = w13_weight_swapped.contiguous()
             w13_weights_shuffled, w2_weights_shuffled = (
                 convert_moe_weights_to_flashinfer_trtllm_block_layout(
                     _cache_permute_indices,
@@ -348,6 +350,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         assert self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM
 
+        activation_type = activation_to_flashinfer_int(layer.activation)
+        if layer.w2_weight.ndim == 4:
+            intermediate_size = (
+                layer.w2_weight.shape[1] * layer.w2_weight.shape[3]
+            )
+        else:
+            intermediate_size = layer.intermediate_size_per_partition
+
         return torch.ops.vllm.flashinfer_fused_moe_bf16(
             routing_logits=router_logits,
             routing_bias=layer.e_score_correction_bias,
@@ -358,10 +368,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             top_k=layer.top_k,
             n_group=layer.num_expert_group,
             topk_group=layer.topk_group,
-            intermediate_size=layer.intermediate_size_per_partition,
+            intermediate_size=intermediate_size,
             local_expert_offset=layer.ep_rank * layer.local_num_experts,
             local_num_experts=layer.local_num_experts,
             routing_method_type=layer.routing_method_type,
+            activation_type=activation_type,
         )
 
     def forward_monolithic_cpu(

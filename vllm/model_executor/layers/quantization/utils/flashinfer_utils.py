@@ -248,6 +248,33 @@ def convert_moe_weights_to_flashinfer_trtllm_block_layout(
     epilogue_tile_m = 128
     block_k = 128
 
+    # TRTLLM BF16 kernels require the per-expert intermediate dim to be aligned.
+    # Pad once during weight preprocessing to avoid cloning/padding expert
+    # weights on every MoE invocation.
+    intermediate_size = w2_weight.shape[-1]
+    pad = (-intermediate_size) % 128
+    if pad:
+        is_gated = w13_weight.shape[-2] == 2 * intermediate_size
+        padded_w13_dim = w13_weight.shape[-2] + (2 if is_gated else 1) * pad
+        logger.info_once(
+            "Padding FlashInfer TRTLLM BF16 expert weights from %d to %d",
+            intermediate_size,
+            intermediate_size + pad,
+            scope="local",
+        )
+
+        padded_w13 = w13_weight.new_zeros(
+            (*w13_weight.shape[:-2], padded_w13_dim, w13_weight.shape[-1])
+        )
+        padded_w13[..., : w13_weight.shape[-2], :] = w13_weight
+        w13_weight = padded_w13.contiguous()
+
+        padded_w2 = w2_weight.new_zeros(
+            (*w2_weight.shape[:-1], intermediate_size + pad)
+        )
+        padded_w2[..., :intermediate_size] = w2_weight
+        w2_weight = padded_w2.contiguous()
+
     # Reorder rows of W13 and W2 for fused gated activation and convert to the
     # block layout expected by the FlashInfer kernel.
     num_experts = w13_weight.shape[0]

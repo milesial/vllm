@@ -400,6 +400,43 @@ def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
     assert w2_converted.shape[0] == num_experts
 
 
+@pytest.mark.parametrize("is_gated", [False, True])
+def test_convert_moe_weights_to_flashinfer_trtllm_block_layout_padding(is_gated):
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
+
+    num_experts = 8
+    intermediate = 1856
+    hidden = 2688
+    padded_intermediate = 1920
+    w13_rows = (2 if is_gated else 1) * intermediate
+    padded_w13_rows = (2 if is_gated else 1) * padded_intermediate
+
+    w13 = torch.randn(
+        (num_experts, w13_rows, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    w2 = torch.randn(
+        (num_experts, hidden, intermediate), dtype=torch.bfloat16, device="cuda"
+    )
+
+    cache: dict[torch.Size, torch.Tensor] = {}
+    w13_converted, w2_converted = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        cache, w13, w2
+    )
+
+    assert w13_converted.ndim == 4
+    assert w2_converted.ndim == 4
+
+    assert w13_converted.shape[0] == num_experts
+    assert w2_converted.shape[0] == num_experts
+
+    assert w13_converted.numel() == num_experts * padded_w13_rows * hidden
+    assert w2_converted.numel() == num_experts * hidden * padded_intermediate
+
+    assert w2_converted.shape[1] * w2_converted.shape[3] == padded_intermediate
+
+
 def test_flashinfer_blockscale_fp8_none_expert_group(monkeypatch):
     """Test that flashinfer_fused_moe_blockscale_fp8 handles num_expert_group=None.
 
