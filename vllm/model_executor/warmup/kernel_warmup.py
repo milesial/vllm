@@ -24,6 +24,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _should_skip_flashinfer_autotune_for_padded_trtllm_nvfp4(model) -> bool:
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        fused_experts = getattr(moe_kernel, "fused_experts", None)
+        if fused_experts is None:
+            continue
+        if (
+            fused_experts.__class__.__name__.startswith("TrtLlmNvFp4Experts")
+            and getattr(fused_experts, "hidden_dim_padding", 0) > 0
+        ):
+            return True
+    return False
+
+
 def kernel_warmup(worker: "Worker"):
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -42,6 +57,11 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
+    elif _should_skip_flashinfer_autotune_for_padded_trtllm_nvfp4(worker.get_model()):
+        logger.info(
+            "Skipping FlashInfer autotune because padded TRTLLM NVFP4 MoE "
+            "experts are active."
+        )
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 

@@ -50,6 +50,10 @@ class TrtLlmNvFp4ExpertsBase:
             moe_config.intermediate_size_per_partition
         )
         self.hidden_dim = moe_config.hidden_dim
+        self.hidden_dim_unpadded = (
+            moe_config.hidden_dim_unpadded or moe_config.hidden_dim
+        )
+        self.hidden_dim_padding = self.hidden_dim - self.hidden_dim_unpadded
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
 
@@ -114,8 +118,28 @@ class TrtLlmNvFp4ExpertsBase:
 
     @staticmethod
     def _supports_shape(hidden_dim: int) -> bool:
-        """Requires hidden dim to be multiple of 512."""
-        return hidden_dim % 512 == 0
+        """Supports 16-aligned hidden dims and pads them to 512 internally."""
+        return hidden_dim % 16 == 0
+
+    def _pad_fp4_activations(
+        self,
+        hidden_states: torch.Tensor,
+        a1q_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.hidden_dim_padding == 0:
+            return hidden_states, a1q_scale
+
+        padded_hidden_states = hidden_states.new_zeros(
+            (*hidden_states.shape[:-1], self.hidden_dim // 2)
+        )
+        padded_hidden_states[..., : hidden_states.shape[-1]] = hidden_states
+
+        padded_a1q_scale = a1q_scale.new_zeros(
+            (*a1q_scale.shape[:-1], self.hidden_dim // 16)
+        )
+        padded_a1q_scale[..., : a1q_scale.shape[-1]] = a1q_scale
+
+        return padded_hidden_states, padded_a1q_scale
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -155,8 +179,8 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
 
         # Hidden states are Nvfp4, packed into int8 dtype, so we
         # need to multiply K by 2 to get the output shape right.
-        assert self.hidden_dim == K * 2
-        output = (M, self.hidden_dim)
+        assert self.hidden_dim_unpadded == K * 2
+        output = (M, self.hidden_dim_unpadded)
 
         return (workspace1, workspace2, output)
 
@@ -194,7 +218,14 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         import vllm.utils.flashinfer as fi_utils
 
         if fi_utils._is_fi_autotuning:
-            return hidden_states
+            output.zero_()
+            return
+
+        hidden_states, a1q_scale = self._pad_fp4_activations(hidden_states, a1q_scale)
+
+        kernel_output = output
+        if self.hidden_dim_padding:
+            kernel_output = output.new_empty((*output.shape[:-1], self.hidden_dim))
 
         # Invoke kernel.
         flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
@@ -227,8 +258,11 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             routing_method_type=1,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
-            output=output,
+            output=kernel_output,
         )
+
+        if self.hidden_dim_padding:
+            output.copy_(kernel_output[..., : self.hidden_dim_unpadded])
 
 
 class TrtLlmNvFp4ExpertsMonolithic(
@@ -311,6 +345,16 @@ class TrtLlmNvFp4ExpertsMonolithic(
             and self.routing_method_type != RoutingMethodType.Llama4
         )
 
+        import vllm.utils.flashinfer as fi_utils
+
+        if fi_utils._is_fi_autotuning:
+            return hidden_states.new_zeros(
+                (hidden_states.shape[0], self.hidden_dim_unpadded),
+                dtype=self.moe_config.in_dtype,
+            )
+
+        hidden_states, a1q_scale = self._pad_fp4_activations(hidden_states, a1q_scale)
+
         # Prepare router logits for kernel format.
         router_logits = (
             router_logits.to(torch.float32)
@@ -324,7 +368,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
             e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
         # Invoke kernel.
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        output = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
@@ -355,3 +399,8 @@ class TrtLlmNvFp4ExpertsMonolithic(
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
         )[0]
+
+        if self.hidden_dim_padding:
+            output = output[..., : self.hidden_dim_unpadded].contiguous()
+
+        return output

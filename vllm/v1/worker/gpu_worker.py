@@ -102,6 +102,24 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _uses_padded_trtllm_nvfp4_hidden_dim(model: nn.Module) -> bool:
+    for module in model.modules():
+        if getattr(module, "uses_padded_trtllm_nvfp4_hidden_dim", False):
+            return True
+
+        quant_method = getattr(module, "quant_method", None)
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        fused_experts = getattr(moe_kernel, "fused_experts", None)
+        if (
+            fused_experts is not None
+            and fused_experts.__class__.__name__.startswith("TrtLlmNvFp4Experts")
+            and getattr(fused_experts, "hidden_dim_padding", 0) > 0
+        ):
+            return True
+
+    return False
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -321,6 +339,24 @@ class Worker(WorkerBase):
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        self._maybe_disable_unsafe_runtime_features()
+
+    def _maybe_disable_unsafe_runtime_features(self) -> None:
+        model = self.model_runner.get_model()
+        if not _uses_padded_trtllm_nvfp4_hidden_dim(model):
+            return
+
+        logger.warning(
+            "Detected TRTLLM NVFP4 MoE hidden-dim padding. "
+            "Disabling FlashInfer autotune, torch.compile, and CUDA graph "
+            "capture for runtime stability."
+        )
+        self.model_config.enforce_eager = True
+        self.compilation_config.mode = CompilationMode.NONE
+        self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        self.compilation_config.max_cudagraph_capture_size = 0
+        self.compilation_config.cudagraph_capture_sizes = []
+        self.vllm_config.kernel_config.enable_flashinfer_autotune = False
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)

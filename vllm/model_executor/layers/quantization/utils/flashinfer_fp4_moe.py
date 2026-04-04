@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     align_fp4_moe_weights_for_fi,
+    align_trtllm_fp4_moe_hidden_dim_for_fi,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     swizzle_blockscale,
@@ -30,6 +31,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "reorder_w1w3_to_w3w1",
+    "uses_padded_trtllm_nvfp4_hidden_dim",
 ]
 
 
@@ -247,6 +249,17 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+        hidden_dim_unpadded = (
+            layer.moe_config.hidden_dim_unpadded or layer.moe_config.hidden_dim
+        )
+        w13, w13_scale, w2, w2_scale, padded_hidden = (
+            align_trtllm_fp4_moe_hidden_dim_for_fi(w13, w13_scale, w2, w2_scale)
+        )
+        layer.uses_padded_trtllm_nvfp4_hidden_dim = (
+            padded_hidden != hidden_dim_unpadded
+        )
+        layer.moe_config.hidden_dim = padded_hidden
+
         # Align weights for FI NVFP4 MoE kernels.
         min_alignment = 16 if is_gated else 128
         w13, w13_scale, w2, w2_scale, padded_intermediate = (
@@ -286,3 +299,10 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         w2_scale = swizzle_blockscale(w2_scale)
 
     return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+
+
+def uses_padded_trtllm_nvfp4_hidden_dim(model: torch.nn.Module) -> bool:
+    for module in model.modules():
+        if getattr(module, "uses_padded_trtllm_nvfp4_hidden_dim", False):
+            return True
+    return False
