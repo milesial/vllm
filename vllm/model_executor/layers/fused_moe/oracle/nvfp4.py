@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from enum import Enum
 
 import torch
@@ -34,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -139,6 +141,17 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
     )
 
 
+def nvfp4_round_up_hidden_size_and_intermediate_size(
+    backend: NvFp4MoeBackend,
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[int, int]:
+    """Round up sizes to satisfy backend-specific NVFP4 MoE constraints."""
+    if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+        hidden_size = round_up(hidden_size, 512)
+    return hidden_size, intermediate_size
+
+
 def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
@@ -195,6 +208,18 @@ def select_nvfp4_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
+        rounded_hidden_size, rounded_intermediate_size = (
+            nvfp4_round_up_hidden_size_and_intermediate_size(
+                backend,
+                config.hidden_dim,
+                config.intermediate_size_per_partition,
+            )
+        )
+        config = replace(
+            config,
+            hidden_dim=rounded_hidden_size,
+            intermediate_size_per_partition=rounded_intermediate_size,
+        )
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format

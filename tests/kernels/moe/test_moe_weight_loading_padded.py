@@ -13,6 +13,10 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
+    nvfp4_round_up_hidden_size_and_intermediate_size,
+)
 
 
 class TestGetHiddenDim:
@@ -290,3 +294,23 @@ class TestWeightLoadingWithPaddedHiddenSize:
                 shard_id="w2",
                 expert_id=0,
             )
+
+
+class TestNvFp4Roundup:
+    def test_trtllm_rounds_hidden_dim_to_512(self):
+        hidden, intermediate = nvfp4_round_up_hidden_size_and_intermediate_size(
+            NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            hidden_size=2688,
+            intermediate_size=2048,
+        )
+        assert hidden == 3072
+        assert intermediate == 2048
+
+    def test_cutlass_keeps_original_hidden_dim(self):
+        hidden, intermediate = nvfp4_round_up_hidden_size_and_intermediate_size(
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+            hidden_size=2688,
+            intermediate_size=2048,
+        )
+        assert hidden == 2688
+        assert intermediate == 2048
