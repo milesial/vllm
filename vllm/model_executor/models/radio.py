@@ -14,12 +14,16 @@ from dataclasses import dataclass
 from itertools import accumulate, repeat
 from typing import TypeAlias
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.intern_vit import (
@@ -27,6 +31,7 @@ from vllm.model_executor.models.intern_vit import (
     InternVisionEncoder,
     InternVisionEncoderLayer,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 input_dim_t: TypeAlias = int | tuple[int, int]
 norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
@@ -513,6 +518,7 @@ class ViTPatchLinear(nn.Linear):
 class MaskMetadata:
     cu_seqlens: torch.Tensor
     max_seqlen: torch.Tensor
+    sequence_lengths: torch.Tensor | None = None
 
 
 class RadioParallelAttention(InternParallelAttention):
@@ -525,11 +531,19 @@ class RadioParallelAttention(InternParallelAttention):
         if self.qk_normalization:
             q, k = self._apply_qk_norm(q, k)
 
-        cu_seqlens, max_seqlen = None, None
+        cu_seqlens, max_seqlen, sequence_lengths = None, None, None
         if mask_meta is not None:
             cu_seqlens = mask_meta.cu_seqlens
             max_seqlen = mask_meta.max_seqlen
-        out = self.attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            sequence_lengths = mask_meta.sequence_lengths
+        out = self.attn(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
         out, _ = self.proj(out)
         return out
 
@@ -646,10 +660,28 @@ class RadioInternVisionModel(nn.Module):
         cu_seqlens = torch.tensor(
             list(accumulate(seq_lens, initial=0)), dtype=torch.int32, device=device
         )
+        sequence_lengths = None
+        attn_backend = self.encoder.layers[0].attn.attn.attn_backend
+        if attn_backend == AttentionBackendEnum.FLASHINFER:
+            host_cu_seqlens = np.asarray(cu_seqlens.cpu().tolist(), dtype=np.int32)
+            sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
+                attn_backend, host_cu_seqlens, device
+            )
+            cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
+                attn_backend,
+                host_cu_seqlens,
+                self.config.hidden_size,
+                1,
+                device,
+            )
         # Keep max_seqlen on CPU to avoid .item() sync
         # See: https://github.com/vllm-project/vllm/blob/20b6b01/vllm/v1/attention/ops/vit_attn_wrappers.py#L48
         max_seqlen = torch.tensor(max(seq_lens), dtype=torch.int32)
-        return MaskMetadata(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        return MaskMetadata(
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
 
     def forward(
         self,
