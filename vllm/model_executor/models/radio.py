@@ -676,7 +676,12 @@ class RadioInternVisionModel(nn.Module):
             )
         # Keep max_seqlen on CPU to avoid .item() sync
         # See: https://github.com/vllm-project/vllm/blob/20b6b01/vllm/v1/attention/ops/vit_attn_wrappers.py#L48
-        max_seqlen = torch.tensor(max(seq_lens), dtype=torch.int32)
+        max_seqlen = torch.tensor(
+            MMEncoderAttention.compute_max_seqlen(attn_backend, host_cu_seqlens)
+            if attn_backend == AttentionBackendEnum.FLASHINFER
+            else max(seq_lens),
+            dtype=torch.int32,
+        )
         return MaskMetadata(
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,

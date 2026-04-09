@@ -365,7 +365,13 @@ class MMEncoderAttention(CustomOp):
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
-        return vit_flashinfer_wrapper(
+        bsz, q_len = query.size()[:2]
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+
+        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
+
+        output = vit_flashinfer_wrapper(
             q=query,
             k=key,
             v=value,
@@ -375,6 +381,9 @@ class MMEncoderAttention(CustomOp):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        return output
 
     def forward_native(
         self,
