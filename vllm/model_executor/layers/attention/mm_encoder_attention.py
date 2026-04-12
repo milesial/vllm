@@ -34,6 +34,9 @@ logger = init_logger(__name__)
 # (cuda graph support) is addressed.
 FLASHINFER_BATCH_BUCKETS = [8, 16, 32, 64]
 FLASHINFER_MAX_SEQLEN_BUCKETS = [
+    256,
+    512,
+    768,
     1 * 1024,
     2 * 1024,
     4 * 1024,
