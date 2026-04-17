@@ -21,8 +21,18 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
+)
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -31,6 +41,7 @@ from vllm.model_executor.models.intern_vit import (
     InternVisionEncoder,
     InternVisionEncoderLayer,
 )
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 input_dim_t: TypeAlias = int | tuple[int, int]
@@ -522,11 +533,99 @@ class MaskMetadata:
 
 
 class RadioParallelAttention(InternParallelAttention):
+    """Radio attention with three separate q/k/v projections.
+
+    Unlike ``InternParallelAttention`` (which fuses q/k/v into a single
+    ``QKVParallelLinear``), this variant uses three independent
+    ``ColumnParallelLinear`` modules. The HF checkpoint still stores the
+    weights fused under ``attn.qkv.{weight,bias}``; ``RadioModel.load_weights``
+    splits them along the output dimension at load time.
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None = None,
+        *,
+        num_dummy_heads: int = 0,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads "
+                f"(got `embed_dim`: {self.embed_dim} and `num_heads`:"
+                f" {self.num_heads})."
+            )
+
+        use_data_parallel = is_vit_use_data_parallel()
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        use_data_parallel = (
+            use_data_parallel or (self.num_heads + num_dummy_heads) % tp_size != 0
+        )
+        self.tp_size = 1 if use_data_parallel else tp_size
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+
+        self.dummy_dim = (num_dummy_heads + self.num_heads) * self.head_dim
+        self.num_heads_per_partition = divide(
+            num_dummy_heads + self.num_heads, self.tp_size
+        )
+
+        self.scale = self.head_dim**-0.5
+
+        def _make_proj(name: str) -> ColumnParallelLinear:
+            return ColumnParallelLinear(
+                self.embed_dim,
+                self.dummy_dim,
+                bias=config.qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.{name}",
+                disable_tp=use_data_parallel,
+            )
+
+        self.q_proj = _make_proj("q_proj")
+        self.k_proj = _make_proj("k_proj")
+        self.v_proj = _make_proj("v_proj")
+
+        self.qk_normalization = config.qk_normalization
+        if self.qk_normalization:
+            self.q_norm = RMSNorm(
+                self.dummy_dim,
+                eps=config.layer_norm_eps,
+                var_hidden_size=self.embed_dim,
+            )
+            self.k_norm = RMSNorm(
+                self.dummy_dim,
+                eps=config.layer_norm_eps,
+                var_hidden_size=self.embed_dim,
+            )
+
+        self.proj = RowParallelLinear(
+            self.dummy_dim,
+            self.embed_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj",
+            disable_tp=use_data_parallel,
+        )
+
+        self.attn = MMEncoderAttention(
+            self.num_heads_per_partition,
+            self.head_dim,
+            self.scale,
+            prefix=f"{prefix}.attn",
+        )
+
     def forward(
         self, x: torch.Tensor, mask_meta: MaskMetadata | None = None
     ) -> torch.Tensor:
-        qkv, _ = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
+        q, _ = self.q_proj(x)
+        k, _ = self.k_proj(x)
+        v, _ = self.v_proj(x)
 
         if self.qk_normalization:
             q, k = self._apply_qk_norm(q, k)
@@ -583,9 +682,8 @@ class RadioVisionEncoder(InternVisionEncoder):
 
 
 class RadioInternVisionModel(nn.Module):
-    packed_modules_mapping = {
-        "qkv": ["qkv"],
-    }
+    # qkv is unfused into separate q_proj/k_proj/v_proj; no packed mapping.
+    packed_modules_mapping: dict[str, list[str]] = {}
 
     def __init__(
         self,
@@ -673,6 +771,10 @@ class RadioInternVisionModel(nn.Module):
                 self.config.hidden_size,
                 1,
                 device,
+                # RadioParallelAttention uses 3 separate q/k/v projections,
+                # so v is contiguous (per-token stride == hidden_size) rather
+                # than a stride-3D view of a fused qkv tensor.
+                qkv_fused=False,
             )
         # Keep max_seqlen on CPU to avoid .item() sync
         # See: https://github.com/vllm-project/vllm/blob/20b6b01/vllm/v1/attention/ops/vit_attn_wrappers.py#L48
@@ -730,9 +832,8 @@ class RadioInternVisionModel(nn.Module):
 
 
 class RadioModel(nn.Module):
-    packed_modules_mapping = {
-        "qkv": ["qkv"],
-    }
+    # qkv is unfused into separate q_proj/k_proj/v_proj; no packed mapping.
+    packed_modules_mapping: dict[str, list[str]] = {}
 
     def __init__(
         self,
@@ -816,6 +917,27 @@ class RadioModel(nn.Module):
                     suffix = ".".join(parts[3:])
                     # Skip layer-scale entries that vLLM doesn't use
                     if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
+                        continue
+                    # HF checkpoint stores q/k/v fused as attn.qkv.{weight,bias}.
+                    # vLLM uses three separate projections, so split along the
+                    # output dim and load each chunk into its own param.
+                    if suffix in {"attn.qkv.weight", "attn.qkv.bias"}:
+                        param_kind = suffix.rsplit(".", 1)[-1]  # weight | bias
+                        q_w, k_w, v_w = weight.chunk(3, dim=0)
+                        base = f"model.encoder.layers.{layer_idx}.attn"
+                        for proj_name, proj_weight in (
+                            ("q_proj", q_w),
+                            ("k_proj", k_w),
+                            ("v_proj", v_w),
+                        ):
+                            target = f"{base}.{proj_name}.{param_kind}"
+                            if target in params_dict:
+                                param = params_dict[target]
+                                wl = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                wl(param, proj_weight)
+                                loaded_params.add(target)
                         continue
                     vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
 

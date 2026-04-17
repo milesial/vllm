@@ -151,10 +151,34 @@ class MMEncoderAttention(CustomOp):
         hidden_size: int,
         tp_size: int,
         device: torch.device,
+        *,
+        qkv_fused: bool = True,
     ) -> torch.Tensor:
+        """Recompute cu_seqlens for the FlashInfer/cuDNN attention path.
+
+        Args:
+            qkv_fused: When True (default) ``v`` is assumed to be a stride-3D
+                view into a fused ``[..., 3 * hidden_size]`` qkv tensor (the
+                output of ``QKVParallelLinear`` after a ``chunk(3, dim=-1)``).
+                Its per-token byte stride is therefore ``3 * hidden_size``.
+                When False, ``v`` is a standalone contiguous tensor (e.g. from
+                a separate ``v_proj``) and uses the same per-token stride as
+                ``q``/``k``/``o``.
+        """
         if (oot_class := maybe_get_oot_by_class(cls)) is not cls:
+            # Only forward `qkv_fused` if it's non-default, to remain
+            # backward compatible with OOT classes that don't accept it.
+            if qkv_fused:
+                return oot_class.maybe_recompute_cu_seqlens(  # type: ignore[attr-defined]
+                    attn_backend, cu_seqlens, hidden_size, tp_size, device
+                )
             return oot_class.maybe_recompute_cu_seqlens(  # type: ignore[attr-defined]
-                attn_backend, cu_seqlens, hidden_size, tp_size, device
+                attn_backend,
+                cu_seqlens,
+                hidden_size,
+                tp_size,
+                device,
+                qkv_fused=qkv_fused,
             )
 
         if attn_backend == AttentionBackendEnum.FLASHINFER:
@@ -163,7 +187,9 @@ class MMEncoderAttention(CustomOp):
             cu_seqlens = cu_seqlens * scale
 
             cu_seqlens_qko = cu_seqlens
-            cu_seqlens_v = cu_seqlens * 3
+            # When v is a view of a fused qkv tensor it advances by 3*hidden
+            # per token; with a standalone v tensor it advances by hidden.
+            cu_seqlens_v = cu_seqlens * 3 if qkv_fused else cu_seqlens
 
             cu_seqlens_qko = add_padding_to_seqlens(
                 cu_seqlens_qko, batch_size, cu_seqlens_qko[-1]
