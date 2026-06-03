@@ -315,6 +315,10 @@ class Executor(ABC):
         """Reset the encoder cache in each worker to clear cached encoder outputs."""
         self.collective_rpc("reset_encoder_cache")
 
+    def reset_kv_connector_cache(self) -> bool:
+        """Reset worker-side KV connector caches in each worker."""
+        return all(self.collective_rpc("reset_kv_connector_cache"))
+
     def sleep(self, level: int = 1):
         if self.is_sleeping:
             logger.warning("Executor is already sleeping.")

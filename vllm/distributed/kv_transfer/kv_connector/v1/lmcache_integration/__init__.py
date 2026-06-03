@@ -8,6 +8,8 @@ from .multi_process_adapter import (
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
+    RequestType,
+    send_lmcache_request,
 )
 
 __all__ = [
@@ -17,4 +19,6 @@ __all__ = [
     "LMCacheMPWorkerAdapter",
     "LoadStoreOp",
     "ParallelStrategy",
+    "RequestType",
+    "send_lmcache_request",
 ]

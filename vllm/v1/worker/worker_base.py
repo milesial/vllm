@@ -122,6 +122,22 @@ class WorkerBase:
         if callable(reset_fn):
             reset_fn()
 
+    def reset_kv_connector_cache(self) -> bool:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return True
+
+        reset_worker_cache = getattr(
+            get_kv_transfer_group(), "reset_worker_cache", None
+        )
+        if not callable(reset_worker_cache):
+            return True
+        return reset_worker_cache() is not False
+
     def get_model(self) -> nn.Module:
         raise NotImplementedError
 

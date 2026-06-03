@@ -299,6 +299,18 @@ class LMCacheMPSchedulerAdapter:
         """
         self.lookup_futures.pop(request_id, None)
 
+    def reset_cache(self) -> bool:
+        """Clear all cached data in the LMCache multiprocess server."""
+        self.lookup_futures.clear()
+
+        try:
+            send_lmcache_request(self.mq_client, RequestType.CLEAR, []).result()
+        except Exception:
+            logger.exception("Failed to clear LMCache multiprocess server cache.")
+            return False
+
+        return True
+
     def end_session(self, request_id: str) -> None:
         """
         Notify LMCache server to remove the session for a finished request.

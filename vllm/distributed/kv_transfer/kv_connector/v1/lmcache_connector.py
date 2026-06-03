@@ -114,6 +114,74 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         self._kv_cache_events: LMCacheKVEvents | None = None
 
+    def _clear_adapter_state(self) -> None:
+        self._kv_cache_events = None
+        clear_state = getattr(self._lmcache_engine, "clear_local_state", None)
+        if callable(clear_state):
+            clear_state()
+            return
+
+        for attr in (
+            "layerwise_retrievers",
+            "load_specs",
+            "_unfinished_requests",
+            "_lookup_requests_in_step",
+            "_request_trackers",
+            "_requests_priority",
+        ):
+            value = getattr(self._lmcache_engine, attr, None)
+            clear = getattr(value, "clear", None)
+            if callable(clear):
+                clear()
+
+    def _clear_lmcache_engine(self) -> bool | None:
+        lmcache_engine = getattr(self._lmcache_engine, "lmcache_engine", None)
+        if lmcache_engine is None:
+            return None
+
+        if getattr(lmcache_engine, "storage_manager", None) is None:
+            logger.debug(
+                "LMCache engine has no storage manager on this rank; "
+                "treating worker cache reset as no-op success."
+            )
+            return None
+
+        clear = getattr(lmcache_engine, "clear", None)
+        if not callable(clear):
+            logger.warning("LMCache engine does not support clear().")
+            return False
+
+        try:
+            clear()
+        except Exception:
+            logger.exception("Failed to reset LMCache engine cache.")
+            return False
+
+        return True
+
+    def reset_cache(self) -> bool | None:
+        reset_cache = getattr(self._lmcache_engine, "reset_cache", None)
+        if callable(reset_cache):
+            self._kv_cache_events = None
+            return reset_cache() is not False
+
+        self._clear_adapter_state()
+        return True
+
+    def reset_worker_cache(self) -> bool | None:
+        reset_worker_cache = getattr(self._lmcache_engine, "reset_worker_cache", None)
+        if callable(reset_worker_cache):
+            self._kv_cache_events = None
+            return reset_worker_cache() is not False
+
+        reset_cache = getattr(self._lmcache_engine, "reset_cache", None)
+        if callable(reset_cache):
+            self._kv_cache_events = None
+            return reset_cache() is not False
+
+        self._clear_adapter_state()
+        return self._clear_lmcache_engine()
+
     # ==============================
     # Worker-side methods
     # ==============================

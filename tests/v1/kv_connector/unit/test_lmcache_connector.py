@@ -67,6 +67,18 @@ def mock_connector():
     connector.take_events = LMCacheConnectorV1.take_events.__get__(
         connector, LMCacheConnectorV1
     )
+    connector._clear_adapter_state = LMCacheConnectorV1._clear_adapter_state.__get__(
+        connector, LMCacheConnectorV1
+    )
+    connector._clear_lmcache_engine = LMCacheConnectorV1._clear_lmcache_engine.__get__(
+        connector, LMCacheConnectorV1
+    )
+    connector.reset_cache = LMCacheConnectorV1.reset_cache.__get__(
+        connector, LMCacheConnectorV1
+    )
+    connector.reset_worker_cache = LMCacheConnectorV1.reset_worker_cache.__get__(
+        connector, LMCacheConnectorV1
+    )
 
     return connector
 
@@ -557,6 +569,80 @@ class TestTakeEvents:
         # No common events, so nothing should be yielded
         assert events == []
         assert mock_connector._kv_cache_events is None
+
+
+class TestResetCache:
+    """Test LMCache reset_cache methods."""
+
+    def test_reset_cache_delegates_to_adapter(self, mock_connector):
+        mock_connector._kv_cache_events = LMCacheKVEvents(num_workers=1)
+        mock_connector._lmcache_engine.reset_cache.return_value = True
+
+        assert mock_connector.reset_cache() is True
+
+        mock_connector._lmcache_engine.reset_cache.assert_called_once()
+        assert mock_connector._kv_cache_events is None
+
+    def test_reset_cache_propagates_adapter_failure(self, mock_connector):
+        mock_connector._lmcache_engine.reset_cache.return_value = False
+
+        assert mock_connector.reset_cache() is False
+
+    def test_reset_cache_fallback_clears_adapter_state(self):
+        class Adapter:
+            def __init__(self):
+                self.layerwise_retrievers = [object()]
+                self.load_specs = {"req": object()}
+                self._unfinished_requests = {"req": object()}
+                self._lookup_requests_in_step = ["req"]
+                self._request_trackers = {"req": object()}
+                self._requests_priority = {"req": 0}
+
+        adapter = Adapter()
+        connector = object.__new__(LMCacheConnectorV1)
+        connector._lmcache_engine = adapter
+        connector._kv_cache_events = LMCacheKVEvents(num_workers=1)
+
+        assert connector.reset_cache() is True
+
+        assert connector._kv_cache_events is None
+        assert adapter.layerwise_retrievers == []
+        assert adapter.load_specs == {}
+        assert adapter._unfinished_requests == {}
+        assert adapter._lookup_requests_in_step == []
+        assert adapter._request_trackers == {}
+        assert adapter._requests_priority == {}
+
+    def test_reset_worker_cache_clears_lmcache_engine(self):
+        class Adapter:
+            pass
+
+        adapter = Adapter()
+        adapter.lmcache_engine = MagicMock()
+        adapter.lmcache_engine.storage_manager = object()
+        connector = object.__new__(LMCacheConnectorV1)
+        connector._lmcache_engine = adapter
+        connector._kv_cache_events = LMCacheKVEvents(num_workers=1)
+
+        assert connector.reset_worker_cache() is True
+
+        adapter.lmcache_engine.clear.assert_called_once()
+        assert connector._kv_cache_events is None
+
+    def test_reset_worker_cache_no_storage_manager_is_no_op_success(self):
+        class Adapter:
+            pass
+
+        adapter = Adapter()
+        adapter.lmcache_engine = MagicMock()
+        adapter.lmcache_engine.storage_manager = None
+        connector = object.__new__(LMCacheConnectorV1)
+        connector._lmcache_engine = adapter
+        connector._kv_cache_events = LMCacheKVEvents(num_workers=1)
+
+        assert connector.reset_worker_cache() is None
+
+        adapter.lmcache_engine.clear.assert_not_called()
 
 
 class TestIntegrationScenarios:

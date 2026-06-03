@@ -29,6 +29,8 @@ try:
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
         ParallelStrategy,
+        RequestType,
+        send_lmcache_request,
     )
 
     try:
@@ -47,6 +49,8 @@ except ImportError:
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
         ParallelStrategy,
+        RequestType,
+        send_lmcache_request,
     )
 
 if TYPE_CHECKING:
@@ -957,6 +961,9 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
 
         return True, return_params
 
+    def reset_cache(self) -> bool | None:
+        return _reset_lmcache_mp_connector(self)
+
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
         Take the KV cache events from the connector.
@@ -1191,6 +1198,53 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             )
 
 
+def _clear_adapter_lookup_state(scheduler_adapter: Any) -> None:
+    for attr in ("lookup_futures", "_pending_lookups", "_finished_lookup_results"):
+        value = getattr(scheduler_adapter, attr, None)
+        clear = getattr(value, "clear", None)
+        if callable(clear):
+            clear()
+
+
+def _reset_lmcache_mp_connector(connector: Any) -> bool | None:
+    if connector.role == KVConnectorRole.WORKER:
+        return None
+    if connector.role != KVConnectorRole.SCHEDULER:
+        logger.warning(
+            "Unsupported LMCache MP connector role for reset: %s", connector.role
+        )
+        return False
+
+    request_trackers = getattr(connector, "request_trackers", None)
+    if request_trackers is not None:
+        request_trackers.clear()
+
+    scheduler_adapter = getattr(connector, "scheduler_adapter", None)
+    if scheduler_adapter is None:
+        logger.warning("LMCache MP scheduler adapter is not initialized.")
+        return False
+
+    reset_cache = getattr(scheduler_adapter, "reset_cache", None)
+    if callable(reset_cache):
+        return reset_cache() is not False
+
+    _clear_adapter_lookup_state(scheduler_adapter)
+    try:
+        future = send_lmcache_request(
+            scheduler_adapter.mq_client, RequestType.CLEAR, []
+        )
+        timeout = getattr(scheduler_adapter, "_mq_timeout", None)
+        if timeout is None:
+            future.result()
+        else:
+            future.result(timeout=timeout)
+    except Exception:
+        logger.exception("Failed to clear LMCache multiprocess server cache.")
+        return False
+
+    return True
+
+
 # At module load time, prefer the external LMCacheMPConnector shipped with the
 # ``lmcache`` package. This avoids forcing users to set
 # ``kv_connector_module_path`` when they only configure ``kv_connector``. If
@@ -1213,6 +1267,15 @@ def _resolve_lmcache_mp_connector() -> type[KVConnectorBase_V1]:
             "Using external LMCacheMPConnector from "
             "lmcache.integration.vllm.lmcache_mp_connector"
         )
+        if "reset_cache" not in _ExternalLMCacheMPConnector.__dict__:
+
+            class LMCacheMPConnectorWithReset(  # type: ignore[misc, valid-type]
+                _ExternalLMCacheMPConnector
+            ):
+                def reset_cache(self) -> bool | None:
+                    return _reset_lmcache_mp_connector(self)
+
+            return LMCacheMPConnectorWithReset
         return _ExternalLMCacheMPConnector
     except ImportError as e:
         logger.info(

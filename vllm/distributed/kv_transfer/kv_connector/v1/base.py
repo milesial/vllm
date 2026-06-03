@@ -672,3 +672,21 @@ class KVConnectorBase_V1(ABC):
         )
 
         return None
+
+    def reset_worker_cache(self) -> bool | None:
+        """
+        Reset worker-side connector cache state.
+
+        This is invoked through worker collective RPCs for connectors whose
+        physical cache state lives on the worker side.
+
+        Returns:
+            bool: True if the cache was successfully reset, False otherwise.
+        """
+        logger.debug(
+            "Worker connector cache reset requested, but %s does not implement "
+            "reset_worker_cache().",
+            type(self).__name__,
+        )
+
+        return None

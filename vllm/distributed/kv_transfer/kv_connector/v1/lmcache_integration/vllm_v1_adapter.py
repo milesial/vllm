@@ -1133,6 +1133,45 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[set[str] | None, set[str] | None]:
         return None, None
 
+    def clear_local_state(self) -> None:
+        self.layerwise_retrievers.clear()
+        self.load_specs.clear()
+        self._request_trackers.clear()
+        self._requests_priority.clear()
+        self.current_layer = 0
+
+        if hasattr(self, "_unfinished_requests"):
+            self._unfinished_requests.clear()
+        if hasattr(self, "_lookup_requests_in_step"):
+            self._lookup_requests_in_step.clear()
+
+    def reset_cache(self) -> bool | None:
+        self.clear_local_state()
+        return self._clear_lmcache_engine()
+
+    def reset_worker_cache(self) -> bool | None:
+        self.clear_local_state()
+        return self._clear_lmcache_engine()
+
+    def _clear_lmcache_engine(self) -> bool | None:
+        if self.lmcache_engine is None:
+            return True
+
+        if getattr(self.lmcache_engine, "storage_manager", None) is None:
+            logger.debug(
+                "LMCache engine has no storage manager on this rank; "
+                "treating worker cache reset as no-op success."
+            )
+            return None
+
+        try:
+            self.lmcache_engine.clear()
+        except Exception:
+            logger.exception("Failed to reset LMCache engine cache.")
+            return False
+
+        return True
+
     ###################
     # Scheduler side APIs
     ####################
