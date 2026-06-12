@@ -126,61 +126,36 @@ def test_mla_tp_dedup_supported_rejects_mixed_uniform_type_group():
     assert not is_mla_tp_dedup_supported(kv_cache_config)
 
 
-def test_should_save_only_first_rank_defaults_to_supported_mla():
-    kv_cache_config = _kv_cache_config(_mla_spec())
-
-    assert should_save_only_first_rank({}, kv_cache_config, tensor_parallel_size=2)
-
-
-def test_should_save_only_first_rank_accepts_explicit_true():
-    kv_cache_config = _kv_cache_config(_mla_spec())
-
-    assert should_save_only_first_rank(
-        {"save_only_first_rank": True},
-        kv_cache_config,
-        tensor_parallel_size=2,
-    )
-
-
-def test_should_save_only_first_rank_can_be_disabled():
-    kv_cache_config = _kv_cache_config(_mla_spec())
-
-    assert not should_save_only_first_rank(
-        {"save_only_first_rank": False},
-        kv_cache_config,
-        tensor_parallel_size=2,
-    )
-
-
-def test_should_save_only_first_rank_rejects_tp1():
-    kv_cache_config = _kv_cache_config(_mla_spec())
-
-    assert not should_save_only_first_rank({}, kv_cache_config, tensor_parallel_size=1)
-
-
-def test_should_save_only_first_rank_rejects_explicit_true_with_tp1():
-    kv_cache_config = _kv_cache_config(_mla_spec())
-
-    assert not should_save_only_first_rank(
-        {"save_only_first_rank": True},
-        kv_cache_config,
-        tensor_parallel_size=1,
-    )
-
-
-def test_should_save_only_first_rank_defaults_to_unsupported_layout_false():
-    kv_cache_config = _kv_cache_config(_full_attention_spec())
-
-    assert not should_save_only_first_rank({}, kv_cache_config, tensor_parallel_size=2)
-
-
-def test_should_save_only_first_rank_rejects_unsupported_layout():
-    kv_cache_config = _kv_cache_config(_full_attention_spec())
-
-    assert not should_save_only_first_rank(
-        {"save_only_first_rank": True},
-        kv_cache_config,
-        tensor_parallel_size=2,
+@pytest.mark.parametrize(
+    ("extra_config", "kv_cache_config", "tensor_parallel_size", "expected"),
+    [
+        ({}, _kv_cache_config(_mla_spec()), 2, True),
+        ({"save_only_first_rank": True}, _kv_cache_config(_mla_spec()), 2, True),
+        ({"save_only_first_rank": False}, _kv_cache_config(_mla_spec()), 2, False),
+        ({}, _kv_cache_config(_mla_spec()), 1, False),
+        ({"save_only_first_rank": True}, _kv_cache_config(_mla_spec()), 1, False),
+        ({}, _kv_cache_config(_full_attention_spec()), 2, False),
+        (
+            {"save_only_first_rank": True},
+            _kv_cache_config(_full_attention_spec()),
+            2,
+            False,
+        ),
+    ],
+)
+def test_should_save_only_first_rank(
+    extra_config: dict[str, bool],
+    kv_cache_config: KVCacheConfig,
+    tensor_parallel_size: int,
+    expected: bool,
+):
+    assert (
+        should_save_only_first_rank(
+            extra_config,
+            kv_cache_config,
+            tensor_parallel_size=tensor_parallel_size,
+        )
+        == expected
     )
 
 
