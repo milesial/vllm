@@ -176,4 +176,5 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
             mmap_region=worker_mmap,
+            tp_dedup_enabled=self.tp_dedup_enabled,
         )

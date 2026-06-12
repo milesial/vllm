@@ -6,9 +6,14 @@ from typing import Any
 from typing_extensions import override
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -22,6 +27,27 @@ from vllm.v1.kv_offload.cpu.common import METRIC_STORES_SKIPPED, CPULoadStoreSpe
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
+
+logger = init_logger(__name__)
+
+_TP_DEDUP_MLA_KINDS = {
+    KVCacheSpecKind.MLA_ATTENTION,
+    KVCacheSpecKind.SLIDING_WINDOW_MLA,
+}
+
+
+def is_mla_tp_dedup_supported(kv_cache_config: KVCacheConfig) -> bool:
+    """Return True if every KV cache group stores replicated MLA latent KV.
+
+    Hybrid layouts are rejected because source-rank-only host I/O can
+    partially populate physical pages shared across canonical tensors.
+    """
+    if not kv_cache_config.kv_cache_groups:
+        return False
+    for group in kv_cache_config.kv_cache_groups:
+        if get_kv_cache_spec_kind(group.kv_cache_spec) not in _TP_DEDUP_MLA_KINDS:
+            return False
+    return True
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -52,7 +78,17 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
-        world_size = vllm_config.parallel_config.world_size
+        parallel_config = vllm_config.parallel_config
+        world_size = parallel_config.world_size
+        self.tp_dedup_enabled = (
+            parallel_config.tensor_parallel_size > 1
+            and is_mla_tp_dedup_supported(kv_cache_config)
+        )
+        if self.tp_dedup_enabled:
+            logger.info(
+                "MLA TP-dedup CPU offload enabled (tp=%d)",
+                parallel_config.tensor_parallel_size,
+            )
         self.num_blocks = 0
         self.kv_bytes_per_offloaded_block = 0
         self.cpu_page_size_per_worker = 0
@@ -119,6 +155,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
+            tp_dedup_enabled=self.tp_dedup_enabled,
         )
 
     @override

@@ -4,6 +4,7 @@ import functools
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -33,6 +34,12 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+HostDescriptorBuffers = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+TPDedupScatterEntry = tuple[torch.Tensor, torch.Tensor, int, int]
 
 
 def _select_swap_blocks_fn(
@@ -68,9 +75,7 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
-    batch_src: torch.Tensor
-    batch_dst: torch.Tensor
-    batch_sizes: torch.Tensor
+    batch_buffers: HostDescriptorBuffers | None
 
 
 def compute_sub_block_ptrs(
@@ -183,6 +188,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        tp_dedup_enabled: bool = False,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -219,6 +225,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
+        self.tp_dedup_enabled: bool = tp_dedup_enabled
         self._swap_blocks_batch = _select_swap_blocks_fn(
             kv_cache_groups_data_refs, gpu_to_cpu
         )
@@ -242,54 +249,127 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    @override
-    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        src_spec, dst_spec = transfer_spec
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        num_src_blocks = len(src_blocks)
-        num_dst_blocks = len(dst_blocks)
-
-        # There are 2 types of transfers:
-        # 1. GPU -> CPU
-        # 2. CPU -> GPU
-        #
-        # transfers are also to CPU blocks, EXCEPT MAYBE for the first and last block.
-        # i.e. the first and last CPU blocks in src_blocks can match against
-        # a smaller (byte-wise) set of GPU blocks in dst_blocks.
-        # In such cases, we may need to skip some gpu-sized sub-blocks,
-        # and start reading/writing from the middle of the first CPU block.
-        # If we have multiple KV cache groups (when using HMA with hybrid models),
-        # we may have a partial first/last CPU block per each group.
-        # The group_sizes parameter encodes the size of each group of blocks
-        # in the GPU dst_blocks.
-        # If group_sizes is None, we assume all blocks belong to a single group.
-        # The logical_offset parameter maps each group of blocks to its logical
-        # offset inside the request, counting in GPU blocks.
-        # This allows us to find the correct starting position
-        # in the matching first CPU block.
-
-        # extract group_sizes from the GPU spec
-        gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
-        assert isinstance(gpu_spec, GPULoadStoreSpec)
-        group_sizes = gpu_spec.group_sizes
-        assert len(group_sizes) == len(self.kv_cache_groups_data_refs)
-
-        # extract block indices from the GPU spec
-        block_indices = gpu_spec.block_indices
-        assert len(block_indices) == len(self.kv_cache_groups_data_refs)
-
-        num_copy_ops = 0
+    def _gather_tp_dedup_source_staging(
+        self, gpu_spec: GPULoadStoreSpec
+    ) -> torch.Tensor | None:
+        chunks: list[torch.Tensor] = []
+        block_offset = 0
         for group_size, group_data_refs in zip(
-            group_sizes, self.kv_cache_groups_data_refs
+            gpu_spec.group_sizes, self.kv_cache_groups_data_refs
         ):
-            num_copy_ops += group_size * len(group_data_refs)
+            group_block_ids = gpu_spec.block_ids[
+                block_offset : block_offset + group_size
+            ]
+            block_offset += group_size
+
+            if group_size == 0:
+                continue
+
+            tensor = self.dst_tensors[group_data_refs[0].tensor_idx]
+            block_ids = torch.as_tensor(
+                group_block_ids,
+                device=tensor.device,
+                dtype=torch.long,
+            )
+            for data_ref in group_data_refs:
+                tensor = self.dst_tensors[data_ref.tensor_idx]
+                tensor_pages = tensor[:, : data_ref.page_size_bytes]
+                chunks.append(tensor_pages.index_select(0, block_ids).reshape(-1))
+
+        return torch.cat(chunks) if chunks else None
+
+    def _prepare_tp_dedup_peer_staging(
+        self, gpu_spec: GPULoadStoreSpec
+    ) -> tuple[torch.Tensor, list[TPDedupScatterEntry]] | None:
+        scatter_entries: list[TPDedupScatterEntry] = []
+        total_numel = 0
+        device = self.dst_tensors[0].device
+        block_offset = 0
+        for group_size, group_data_refs in zip(
+            gpu_spec.group_sizes, self.kv_cache_groups_data_refs
+        ):
+            group_block_ids = gpu_spec.block_ids[
+                block_offset : block_offset + group_size
+            ]
+            block_offset += group_size
+
+            if group_size == 0:
+                continue
+
+            tensor = self.dst_tensors[group_data_refs[0].tensor_idx]
+            block_ids = torch.as_tensor(
+                group_block_ids,
+                device=tensor.device,
+                dtype=torch.long,
+            )
+            for data_ref in group_data_refs:
+                tensor = self.dst_tensors[data_ref.tensor_idx]
+                tensor_pages = tensor[:, : data_ref.page_size_bytes]
+                scatter_entries.append(
+                    (tensor_pages, block_ids, group_size, data_ref.page_size_bytes)
+                )
+                total_numel += group_size * data_ref.page_size_bytes
+
+        if total_numel == 0:
+            return None
+        staging = torch.empty(total_numel, dtype=torch.int8, device=device)
+        return staging, scatter_entries
+
+    def _scatter_tp_dedup_peer_staging(
+        self,
+        staging: torch.Tensor,
+        scatter_entries: list[TPDedupScatterEntry],
+    ) -> None:
+        offset = 0
+        for tensor_pages, block_ids, group_size, page_size_bytes in scatter_entries:
+            end_offset = offset + group_size * page_size_bytes
+            pages = staging[offset:end_offset].view(group_size, page_size_bytes)
+            tensor_pages.index_copy_(0, block_ids, pages)
+            offset = end_offset
+
+    def _broadcast_tp_dedup_gpu_blocks(
+        self,
+        gpu_spec: GPULoadStoreSpec,
+        tp_group: "GroupCoordinator",
+    ) -> None:
+        """Broadcast loaded MLA KV pages after source-rank host reads."""
+        if tp_group.rank_in_group == 0:
+            staging = self._gather_tp_dedup_source_staging(gpu_spec)
+            if staging is None:
+                return
+            tp_group.broadcast(staging, src=0)
+            return
+
+        prepared_staging = self._prepare_tp_dedup_peer_staging(gpu_spec)
+        if prepared_staging is None:
+            return
+        staging, scatter_entries = prepared_staging
+        tp_group.broadcast(staging, src=0)
+        self._scatter_tp_dedup_peer_staging(staging, scatter_entries)
+
+    def _build_host_descriptors(
+        self,
+        src_blocks: np.ndarray,
+        dst_blocks: np.ndarray,
+        gpu_spec: GPULoadStoreSpec,
+        num_src_blocks: int,
+        num_dst_blocks: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        HostDescriptorBuffers,
+        int,
+        int,
+    ]:
+        group_sizes = gpu_spec.group_sizes
+        block_indices = gpu_spec.block_indices
+        num_copy_ops = sum(
+            group_size * len(group_data_refs)
+            for group_size, group_data_refs in zip(
+                group_sizes, self.kv_cache_groups_data_refs
+            )
+        )
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
         batch_src, batch_dst, batch_sizes = (
@@ -310,7 +390,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_offset = 0
         dst_offset = 0
         op_idx = 0
-        # count total number of bytes copied
         num_transfer_bytes = 0
         for group_size, block_idx, group_data_refs in zip(
             group_sizes, block_indices, self.kv_cache_groups_data_refs
@@ -368,6 +447,83 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
+        return (
+            src,
+            dst,
+            sizes,
+            (batch_src, batch_dst, batch_sizes),
+            num_copy_ops,
+            num_transfer_bytes,
+        )
+
+    @override
+    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+        src_spec, dst_spec = transfer_spec
+        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+
+        src_blocks = src_spec.block_ids
+        dst_blocks = dst_spec.block_ids
+        assert src_blocks.ndim == 1
+        assert dst_blocks.ndim == 1
+
+        num_src_blocks = len(src_blocks)
+        num_dst_blocks = len(dst_blocks)
+
+        # There are 2 types of transfers:
+        # 1. GPU -> CPU
+        # 2. CPU -> GPU
+        #
+        # transfers are also to CPU blocks, EXCEPT MAYBE for the first and last block.
+        # i.e. the first and last CPU blocks in src_blocks can match against
+        # a smaller (byte-wise) set of GPU blocks in dst_blocks.
+        # In such cases, we may need to skip some gpu-sized sub-blocks,
+        # and start reading/writing from the middle of the first CPU block.
+        # If we have multiple KV cache groups (when using HMA with hybrid models),
+        # we may have a partial first/last CPU block per each group.
+        # The group_sizes parameter encodes the size of each group of blocks
+        # in the GPU dst_blocks.
+        # If group_sizes is None, we assume all blocks belong to a single group.
+        # The logical_offset parameter maps each group of blocks to its logical
+        # offset inside the request, counting in GPU blocks.
+        # This allows us to find the correct starting position
+        # in the matching first CPU block.
+
+        # extract group_sizes from the GPU spec
+        gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
+        assert isinstance(gpu_spec, GPULoadStoreSpec)
+        assert len(gpu_spec.group_sizes) == len(self.kv_cache_groups_data_refs)
+        assert len(gpu_spec.block_indices) == len(self.kv_cache_groups_data_refs)
+
+        tp_group = None
+        should_skip_host_transfer = False
+        if self.tp_dedup_enabled:
+            # Lazy import: model-parallel groups are initialized after module load.
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            should_skip_host_transfer = tp_group.rank_in_group != 0
+
+        num_transfer_bytes = 0
+        num_copy_ops = 0
+        src = dst = sizes = None
+        batch_buffers = None
+        if not should_skip_host_transfer:
+            (
+                src,
+                dst,
+                sizes,
+                batch_buffers,
+                num_copy_ops,
+                num_transfer_bytes,
+            ) = self._build_host_descriptors(
+                src_blocks,
+                dst_blocks,
+                gpu_spec,
+                num_src_blocks,
+                num_dst_blocks,
+            )
+
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )
@@ -400,12 +556,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         with current_platform.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
+                assert src is not None
+                assert dst is not None
+                assert sizes is not None
                 self._swap_blocks_batch(
                     src,
                     dst,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
+            if not self.gpu_to_cpu and tp_group is not None:
+                self._broadcast_tp_dedup_gpu_blocks(gpu_spec, tp_group)
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -416,9 +577,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 start_event=start_event,
                 end_event=end_event,
                 num_bytes=num_transfer_bytes,
-                batch_src=batch_src,
-                batch_dst=batch_dst,
-                batch_sizes=batch_sizes,
+                batch_buffers=batch_buffers,
             )
         )
 
@@ -445,9 +604,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
-            self._buffer_pool.append(
-                (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
-            )
+            if transfer.batch_buffers is not None:
+                self._buffer_pool.append(transfer.batch_buffers)
             del self._transfer_events[transfer.job_id]
         return results
 
@@ -481,6 +639,7 @@ class CpuGpuOffloadingHandlers:
         block_size_factor: int,
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
+        tp_dedup_enabled: bool = False,
     ):
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
@@ -525,6 +684,7 @@ class CpuGpuOffloadingHandlers:
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             mmap_region=mmap_region,
+            tp_dedup_enabled=tp_dedup_enabled,
         )
 
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
@@ -533,4 +693,5 @@ class CpuGpuOffloadingHandlers:
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            tp_dedup_enabled=tp_dedup_enabled,
         )
