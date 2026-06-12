@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
 import torch
 
 from vllm.v1.kv_cache_interface import (
@@ -11,7 +12,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.kv_offload.cpu.spec import is_mla_tp_dedup_supported
+from vllm.v1.kv_offload.cpu.spec import (
+    is_mla_tp_dedup_supported,
+    should_save_only_first_rank,
+)
 
 
 def _kv_cache_config(*specs: KVCacheSpec) -> KVCacheConfig:
@@ -120,3 +124,72 @@ def test_mla_tp_dedup_supported_rejects_mixed_uniform_type_group():
     )
 
     assert not is_mla_tp_dedup_supported(kv_cache_config)
+
+
+def test_should_save_only_first_rank_defaults_to_supported_mla():
+    kv_cache_config = _kv_cache_config(_mla_spec())
+
+    assert should_save_only_first_rank({}, kv_cache_config, tensor_parallel_size=2)
+
+
+def test_should_save_only_first_rank_accepts_explicit_true():
+    kv_cache_config = _kv_cache_config(_mla_spec())
+
+    assert should_save_only_first_rank(
+        {"save_only_first_rank": True},
+        kv_cache_config,
+        tensor_parallel_size=2,
+    )
+
+
+def test_should_save_only_first_rank_can_be_disabled():
+    kv_cache_config = _kv_cache_config(_mla_spec())
+
+    assert not should_save_only_first_rank(
+        {"save_only_first_rank": False},
+        kv_cache_config,
+        tensor_parallel_size=2,
+    )
+
+
+def test_should_save_only_first_rank_rejects_tp1():
+    kv_cache_config = _kv_cache_config(_mla_spec())
+
+    assert not should_save_only_first_rank({}, kv_cache_config, tensor_parallel_size=1)
+
+
+def test_should_save_only_first_rank_rejects_explicit_true_with_tp1():
+    kv_cache_config = _kv_cache_config(_mla_spec())
+
+    assert not should_save_only_first_rank(
+        {"save_only_first_rank": True},
+        kv_cache_config,
+        tensor_parallel_size=1,
+    )
+
+
+def test_should_save_only_first_rank_defaults_to_unsupported_layout_false():
+    kv_cache_config = _kv_cache_config(_full_attention_spec())
+
+    assert not should_save_only_first_rank({}, kv_cache_config, tensor_parallel_size=2)
+
+
+def test_should_save_only_first_rank_rejects_unsupported_layout():
+    kv_cache_config = _kv_cache_config(_full_attention_spec())
+
+    assert not should_save_only_first_rank(
+        {"save_only_first_rank": True},
+        kv_cache_config,
+        tensor_parallel_size=2,
+    )
+
+
+def test_should_save_only_first_rank_rejects_string_value():
+    kv_cache_config = _kv_cache_config(_mla_spec())
+
+    with pytest.raises(ValueError, match="save_only_first_rank must be a bool"):
+        should_save_only_first_rank(
+            {"save_only_first_rank": "false"},
+            kv_cache_config,
+            tensor_parallel_size=2,
+        )

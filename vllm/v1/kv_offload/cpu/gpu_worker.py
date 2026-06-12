@@ -201,6 +201,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 Order should match gpu_tensors.
             kv_cache_groups_data_refs: list of CanonicalKVCacheRef per group.
             gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
+            mmap_region: optional shared CPU offload backing region.
+            tp_dedup_enabled: if True, only TP rank 0 reads/writes host KV.
         """
         assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0

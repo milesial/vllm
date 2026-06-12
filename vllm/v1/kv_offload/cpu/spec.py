@@ -50,6 +50,49 @@ def is_mla_tp_dedup_supported(kv_cache_config: KVCacheConfig) -> bool:
     return True
 
 
+def should_save_only_first_rank(
+    extra_config: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+    tensor_parallel_size: int,
+) -> bool:
+    """Resolve the LMCache-compatible ``save_only_first_rank`` knob.
+
+    Args:
+        extra_config: KV connector extra config.
+        kv_cache_config: KV cache layout to check for replicated MLA KV.
+        tensor_parallel_size: Tensor-parallel group size.
+
+    Returns:
+        True when native CPU offload can use source-rank-only host I/O,
+        implemented by the MLA TP-dedup broadcast path. The default is True
+        for supported MLA TP layouts and False otherwise. Explicit True is
+        still rejected for TP=1 or non-MLA layouts.
+    """
+    raw_save_only_first_rank = extra_config.get("save_only_first_rank")
+    if raw_save_only_first_rank is not None and not isinstance(
+        raw_save_only_first_rank, bool
+    ):
+        raise ValueError(
+            "save_only_first_rank must be a bool, got "
+            f"{type(raw_save_only_first_rank).__name__}="
+            f"{raw_save_only_first_rank!r}"
+        )
+
+    mla_tp_dedup_supported = is_mla_tp_dedup_supported(kv_cache_config)
+    supported = tensor_parallel_size > 1 and mla_tp_dedup_supported
+    if raw_save_only_first_rank is True and not supported:
+        logger.warning(
+            "save_only_first_rank=True ignored: requires tp_size>1 and "
+            "MLA-only KV cache layout (tp_size=%d, mla_supported=%s).",
+            tensor_parallel_size,
+            mla_tp_dedup_supported,
+        )
+
+    if not supported:
+        return False
+    return True if raw_save_only_first_rank is None else raw_save_only_first_rank
+
+
 class CPUOffloadingSpec(OffloadingSpec):
     BLOCK_SIZE_ALIGNMENT = 1
 
@@ -80,13 +123,14 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         parallel_config = vllm_config.parallel_config
         world_size = parallel_config.world_size
-        self.tp_dedup_enabled = (
-            parallel_config.tensor_parallel_size > 1
-            and is_mla_tp_dedup_supported(kv_cache_config)
+        self.save_only_first_rank = should_save_only_first_rank(
+            self.extra_config,
+            kv_cache_config,
+            parallel_config.tensor_parallel_size,
         )
-        if self.tp_dedup_enabled:
+        if self.save_only_first_rank:
             logger.info(
-                "MLA TP-dedup CPU offload enabled (tp=%d)",
+                "CPU offload save_only_first_rank=True (MLA, tp=%d)",
                 parallel_config.tensor_parallel_size,
             )
         self.num_blocks = 0
@@ -155,7 +199,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
-            tp_dedup_enabled=self.tp_dedup_enabled,
+            tp_dedup_enabled=self.save_only_first_rank,
         )
 
     @override
